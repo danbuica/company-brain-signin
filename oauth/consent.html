@@ -156,6 +156,16 @@
       min-height: 0;
     }
     .error:empty { display: none; }
+    .warning {
+      color: var(--danger);
+      background: color-mix(in srgb, var(--danger) 9%, transparent);
+      border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 14px;
+      margin: 0 0 16px;
+    }
+    .actions.one { grid-template-columns: 1fr; }
     .spinner {
       width: 22px;
       height: 22px;
@@ -215,8 +225,9 @@
         <div class="fact"><dt>Signed in as</dt><dd id="consent-email"></dd></div>
         <div class="fact" id="consent-return-row" hidden><dt>Returns to</dt><dd id="consent-return"></dd></div>
       </dl>
+      <p class="warning" id="consent-warning" role="alert" hidden></p>
       <p class="error" id="consent-error" role="alert"></p>
-      <div class="actions two">
+      <div class="actions two" id="consent-actions">
         <button type="button" class="secondary" id="btn-deny">Deny</button>
         <button type="button" class="primary" id="btn-allow">Allow</button>
       </div>
@@ -240,6 +251,12 @@
     // Public by design: the project URL and the publishable key.
     var SUPABASE_URL = "https://tnnbiucrzezaxvkuwwpl.supabase.co";
     var SUPABASE_PUBLISHABLE_KEY = "sb_publishable_AU30q-XQ5ycW0B5Yk_9hoA_kR1EKklN";
+
+    // Apps allowed to receive access: they must return to one of these addresses.
+    // Add a host here before connecting a new kind of app.
+    var KNOWN_RETURN_HOSTS = ["claude.ai", "chatgpt.com"];
+    // Apps on your own computer (Claude Code, Claude Desktop) return to localhost.
+    var LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
 
     var VIEWS = ["loading", "choose", "login", "consent", "error"];
     var $ = function (id) { return document.getElementById(id); };
@@ -272,16 +289,28 @@
       try { return new URL(url).host; } catch (e) { return ""; }
     }
 
-    // Leave only for real http(s) addresses returned by Supabase.
-    function goTo(url) {
+    function isKnownReturn(url) {
       var u;
-      try { u = new URL(url); } catch (e) { u = null; }
-      if (!u || (u.protocol !== "https:" && u.protocol !== "http:")) {
-        fail("Something went wrong", "The app's return address is not valid. Go back to the app and connect again.");
+      try { u = new URL(url); } catch (e) { return false; }
+      if (u.protocol === "https:" && KNOWN_RETURN_HOSTS.indexOf(u.hostname) !== -1) return true;
+      return (u.protocol === "http:" || u.protocol === "https:") && LOCAL_HOSTS.indexOf(u.hostname) !== -1;
+    }
+
+    // The session lives only in this tab and ends as soon as the person has answered.
+    function endSession() {
+      var timeout = new Promise(function (resolve) { setTimeout(resolve, 3000); });
+      return Promise.race([client.auth.signOut({ scope: "local" }).catch(function () {}), timeout]);
+    }
+
+    // Leave only for a known app's address returned by Supabase, after signing out here.
+    function goTo(url) {
+      if (!isKnownReturn(url)) {
+        endSession();
+        fail("Not sent back", "This app's return address is not one this brain knows, so this page stopped here. You can close it.");
         return;
       }
       loading("Taking you back to the app…");
-      window.location.replace(u.href);
+      endSession().then(function () { window.location.replace(new URL(url).href); });
     }
 
     // 1. The authorization id from the address
@@ -296,8 +325,25 @@
       return;
     }
 
+    // Remove any session an earlier version of this page kept in localStorage,
+    // which every site on this github.io address could read.
+    try {
+      for (var i = window.localStorage.length - 1; i >= 0; i--) {
+        var key = window.localStorage.key(i);
+        if (key && key.indexOf("sb-") === 0) window.localStorage.removeItem(key);
+      }
+    } catch (e) { /* storage unavailable */ }
+
+    var tabStorage;
+    try { tabStorage = window.sessionStorage; } catch (e) { tabStorage = undefined; }
+
     var client = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
+      auth: {
+        storage: tabStorage,
+        persistSession: !!tabStorage,
+        autoRefreshToken: true,
+        detectSessionInUrl: false
+      }
     });
 
     var details = null;
@@ -327,6 +373,13 @@
         $("consent-return").textContent = host;
         $("consent-return-row").hidden = !host;
         $("consent-error").textContent = "";
+        var known = isKnownReturn(data.redirect_uri);
+        $("btn-allow").hidden = !known;
+        $("consent-actions").className = known ? "actions two" : "actions one";
+        $("consent-warning").hidden = known;
+        $("consent-warning").textContent = known ? "" :
+          "This app returns to " + (host || "an unknown address") + ", which is not one of the apps this brain knows. " +
+          "It may be pretending to be something else. Deny it, and ask the admin if you expected it.";
         setConsentButtons(false);
         show("consent");
       }, function (err) {
@@ -342,6 +395,7 @@
     // 4. Allow or deny, then follow the address Supabase returns
     function decide(allow) {
       if (busy || !details) return;
+      if (allow && !isKnownReturn(details.redirect_uri)) return;
       busy = true;
       setConsentButtons(true);
       $("consent-error").textContent = "";
@@ -353,6 +407,11 @@
           busy = false;
           setConsentButtons(false);
           $("consent-error").textContent = res.error ? errorText(res.error) : "Supabase did not return a way back to the app. Try again.";
+          return;
+        }
+        if (!allow && !isKnownReturn(res.data.redirect_url)) {
+          endSession();
+          fail("Request denied", "Nothing was shared with that app. You can close this page.");
           return;
         }
         goTo(res.data.redirect_url);
